@@ -2630,14 +2630,18 @@ export class AgentService {
     }
   }
 
-  async readChatImageAttachment(
+  async readChatAttachment(
     orgId: string,
     attachmentId: string,
     access: ChatProfileAccess
   ): Promise<LoadedAttachmentBytes | null> {
     const record = await this.db.getAttachment(attachmentId);
 
-    if (!record || record.orgId !== orgId || record.kind !== "image") {
+    if (
+      !record ||
+      record.orgId !== orgId ||
+      (record.kind !== "image" && record.kind !== "document")
+    ) {
       return null;
     }
 
