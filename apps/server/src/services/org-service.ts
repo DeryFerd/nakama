@@ -1055,6 +1055,7 @@ export class OrgService {
       "discord",
       "whatsapp",
       "slack",
+      "teams",
     ] as const) {
       for (const owner of await listChannelOwners(platform)) {
         if (owner.orgId === orgId) {

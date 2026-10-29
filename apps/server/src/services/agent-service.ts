@@ -458,6 +458,7 @@ type ChatProfileAccess = Pick<
 const SHARED_HISTORY_CHANNELS: readonly AgentChannel[] = [
   "discord",
   "slack",
+  "teams",
   "telegram",
   "whatsapp",
 ];
@@ -6259,7 +6260,8 @@ export class AgentService {
       channel === "telegram" ||
       channel === "whatsapp" ||
       channel === "discord" ||
-      channel === "slack"
+      channel === "slack" ||
+      channel === "teams"
         ? "member"
         : orgRole;
 

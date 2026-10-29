@@ -157,6 +157,9 @@ export const queryKeys = {
     profile: (profileId: string) => ["soul", "profile", profileId] as const,
   },
   systemStatus: ["systemStatus"] as const,
+  teams: {
+    settings: ["teams", "settings"] as const,
+  },
   telegram: {
     requests: ["telegram", "requests"] as const,
     settings: ["telegram", "settings"] as const,
