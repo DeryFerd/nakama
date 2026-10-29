@@ -1,7 +1,10 @@
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type {
   HealthResponse,
   LlmUsageStats,
   LlmUsageStatus,
+  NakamaUpgradeResponse,
   NakamaVersionResponse,
   SystemStatusResponse,
   WorkerProcessInfo,
@@ -382,4 +385,105 @@ export async function checkNakamaVersion(
     releaseUrl: cachedRelease.releaseUrl,
     updateAvailable: isNewer(cachedRelease.latest, current),
   };
+}
+
+const UPDATER_STALE_MS = 30_000;
+
+const upgradeStatusSchema = z.object({
+  at: z.string(),
+  message: z.string(),
+  state: z.enum(["running", "done", "failed", "rolled_back"]),
+  version: z.string(),
+});
+
+function updaterDir(): string | null {
+  return process.env.NAKAMA_UPDATER_DIR?.trim() || null;
+}
+
+const ARCHIVE_NAME = /^pre-upgrade-(\d+\.\d+\.\d+)-(\d{8}T\d{6}Z)\.tar\.gz$/;
+
+/** The updater archives the data each time it leaves a version. */
+async function listRollbacks(
+  current: string
+): Promise<NakamaUpgradeResponse["rollbacks"]> {
+  const dir = process.env.NAKAMA_BACKUP_DIR?.trim();
+  const names = dir ? await readdir(dir).catch(() => []) : [];
+  const newest = new Map<string, string>();
+
+  for (const name of names.sort().reverse()) {
+    const [, version, stamp] = ARCHIVE_NAME.exec(name) ?? [];
+
+    if (version && stamp && version !== current && !newest.has(version)) {
+      newest.set(version, stamp);
+    }
+  }
+
+  return [...newest].map(([version, stamp]) => ({
+    at: stamp.replace(
+      /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/,
+      "$1-$2-$3T$4:$5:$6Z"
+    ),
+    version,
+  }));
+}
+
+/** The updater touches its heartbeat every two seconds while it waits. */
+export async function readUpgradeState(
+  current: string,
+  now = Date.now()
+): Promise<NakamaUpgradeResponse> {
+  const dir = updaterDir();
+
+  if (!dir) {
+    return { available: false, rollbacks: [], status: null };
+  }
+
+  const beat = await stat(join(dir, "heartbeat")).catch(() => null);
+
+  const status = upgradeStatusSchema.safeParse(
+    await readFile(join(dir, "status.json"), "utf8")
+      .then(JSON.parse)
+      .catch(() => null)
+  );
+
+  return {
+    available: beat !== null && now - beat.mtimeMs < UPDATER_STALE_MS,
+    rollbacks: await listRollbacks(current),
+    status: status.success ? status.data : null,
+  };
+}
+
+export async function requestUpgrade(
+  version: string,
+  current: string,
+  action: "upgrade" | "rollback" = "upgrade"
+): Promise<NakamaUpgradeResponse> {
+  const state = await readUpgradeState(current);
+  const dir = updaterDir();
+
+  if (!(dir && state.available)) {
+    throw new NakamaApiError("The updater service is not running.", 409);
+  }
+
+  if (state.status?.state === "running") {
+    throw new NakamaApiError("An upgrade is already running.", 409);
+  }
+
+  if (
+    action === "rollback" &&
+    !state.rollbacks.some((entry) => entry.version === version)
+  ) {
+    throw new NakamaApiError(`There is no archive of ${version}.`, 400);
+  }
+
+  if (action === "upgrade" && !isNewer(version, current)) {
+    throw new NakamaApiError(
+      `${version} is not a release newer than ${current}.`,
+      400
+    );
+  }
+
+  await writeFile(join(dir, "request"), `${action} ${version}\n`);
+
+  return state;
 }

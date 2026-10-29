@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getNakamaVersion } from "@nakama/core";
 import { createInMemoryDatabaseAdapter } from "@nakama/db";
 import { asTestFetch } from "../../providers/test-helpers";
@@ -131,5 +134,122 @@ describe("GET /v1/system/version", () => {
     );
 
     expect(updates).toEqual([false, true, true, false, false]);
+  });
+
+  test("the Update button hands a newer version to a running updater, platform admins only, not org admins or members", async () => {
+    const { app, authService, databaseAdapter } = createMinimalHonoApp({
+      agent: { listProfiles: async () => ({ profiles: [] }) },
+      databaseAdapter: createInMemoryDatabaseAdapter(),
+    });
+
+    const admin = await setupFreshInstallSession(
+      app,
+      databaseAdapter,
+      "admin-upgrade@org.com"
+    );
+
+    const upgrade = (
+      session: typeof admin,
+      orgId: string,
+      version: string,
+      rollback?: boolean
+    ) =>
+      app.fetch(
+        new Request("http://localhost:4310/v1/system/upgrade", {
+          body: JSON.stringify({ rollback, version }),
+          headers: session.headers(
+            {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": session.csrfToken,
+            },
+            orgId
+          ),
+          method: "POST",
+        })
+      );
+
+    const dir = mkdtempSync(join(tmpdir(), "nakama-updates-"));
+    const backups = mkdtempSync(join(tmpdir(), "nakama-backups-"));
+
+    for (const name of [
+      "pre-upgrade-0.4.59-20261020T010000Z.tar.gz",
+      "pre-upgrade-0.4.59-20261027T033509Z.tar.gz",
+      `pre-upgrade-${getNakamaVersion()}-20261027T040000Z.tar.gz`,
+      "nakama-2026-10-27T033320Z.zip.enc",
+    ]) {
+      writeFileSync(join(backups, name), "");
+    }
+
+    process.env.NAKAMA_UPDATER_DIR = dir;
+    process.env.NAKAMA_BACKUP_DIR = backups;
+
+    try {
+      expect((await upgrade(admin, admin.orgId!, "999.0.0")).status).toBe(409);
+
+      writeFileSync(join(dir, "heartbeat"), "");
+
+      expect((await upgrade(admin, admin.orgId!, "latest")).status).toBe(400);
+      expect((await upgrade(admin, admin.orgId!, "0.0.1")).status).toBe(400);
+      expect((await upgrade(admin, admin.orgId!, "999.0.0")).status).toBe(202);
+      expect(readFileSync(join(dir, "request"), "utf8")).toBe(
+        "upgrade 999.0.0\n"
+      );
+
+      const state = await app.fetch(
+        new Request("http://localhost:4310/v1/system/upgrade", {
+          headers: admin.headers({}, admin.orgId!),
+        })
+      );
+
+      // Newest archive per version, and never the running one.
+      expect((await state.json()).rollbacks).toEqual([
+        { at: "2026-10-27T03:35:09Z", version: "0.4.59" },
+      ]);
+      expect((await upgrade(admin, admin.orgId!, "0.4.58", true)).status).toBe(
+        400
+      );
+      expect((await upgrade(admin, admin.orgId!, "0.4.59", true)).status).toBe(
+        202
+      );
+      expect(readFileSync(join(dir, "request"), "utf8")).toBe(
+        "rollback 0.4.59\n"
+      );
+
+      writeFileSync(
+        join(dir, "status.json"),
+        JSON.stringify({
+          at: "2026-10-27T00:00:00Z",
+          message: "Starting 999.0.0.",
+          state: "running",
+          version: "999.0.0",
+        })
+      );
+
+      expect((await upgrade(admin, admin.orgId!, "999.0.0")).status).toBe(409);
+
+      for (const role of ["admin", "member"] as const) {
+        const tenant = await seedOrgAdmin(databaseAdapter, {
+          authService,
+          email: `tenant-${role}-upgrade@example.com`,
+          orgId: "upgrade-tenant",
+          role,
+          userId: `user_upgrade_${role}`,
+        });
+
+        const session = await loginUserSession(
+          app,
+          tenant.email,
+          tenant.password,
+          tenant.orgId
+        );
+
+        expect((await upgrade(session, tenant.orgId, "999.0.0")).status).toBe(
+          403
+        );
+      }
+    } finally {
+      delete process.env.NAKAMA_UPDATER_DIR;
+      delete process.env.NAKAMA_BACKUP_DIR;
+    }
   });
 });
