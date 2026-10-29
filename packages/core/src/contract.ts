@@ -2968,6 +2968,7 @@ export type ProviderName =
   | "zhipu_cn"
   | "xai"
   | "groq"
+  | "cheaper_inference"
   | "together"
   | "xiaomi"
   | "meta"
