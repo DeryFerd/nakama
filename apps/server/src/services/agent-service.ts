@@ -451,6 +451,11 @@ export interface CreateSessionOptions {
 /** sub_agent chats one parent may start; the cap proposed on #2036. */
 const MAX_CHILD_SESSIONS = 5;
 
+const SUB_AGENT_INSTRUCTIONS = [
+  "You are running as a focused sub-agent delegated from a parent conversation.",
+  "Complete the assigned task and return a clear final answer.",
+];
+
 type ChatProfileAccess = Pick<
   CreateSessionOptions,
   "excludeSuperNakama" | "isPlatformAdmin" | "orgRole"
@@ -2317,10 +2322,7 @@ export class AgentService {
 
   runSubAgentPrompt(input: SubAgentRunInput): Promise<SubAgentRunResult> {
     return this.runOneShotTurn(input, {
-      instructions: [
-        "You are running as a focused sub-agent delegated from a parent conversation.",
-        "Complete the assigned task and return a clear final answer.",
-      ],
+      instructions: SUB_AGENT_INSTRUCTIONS,
       log: "sub_agent",
       tools: () => [],
     });
@@ -3173,6 +3175,10 @@ export class AgentService {
     );
 
     return session ? toSessionSummary(session) : null;
+  }
+
+  isCognitoSession(sessionId: string): boolean {
+    return this.ephemeralSessions.has(sessionId);
   }
 
   scheduleSessionTitleGeneration(sessionId: string): void {
@@ -6443,6 +6449,16 @@ export class AgentService {
     // chat, so a cognito session never gets it whatever the channel allows.
     const includeSkillManageTools = !cognito && SKILL_MANAGE_CHANNELS[channel];
 
+    // A chat sub_agent started runs with nobody watching, so it gets the same
+    // limits as the in-memory sub-agent run. A branch has a parent too, but it
+    // also has the message it branched at.
+    const sessionRecord = cognito ? null : await this.db.getSession(sessionId);
+
+    const subAgentChat = Boolean(
+      sessionRecord?.parentSessionId &&
+        (sessionRecord.branchMessageIndex ?? null) === null
+    );
+
     const pluginOrgRole =
       channel === "telegram" ||
       channel === "whatsapp" ||
@@ -6457,8 +6473,12 @@ export class AgentService {
         pluginOrgRole === "admin" || pluginOrgRole === "member"
           ? pluginOrgRole
           : undefined,
+      includeAutomationTools: !subAgentChat,
       includeMemoryWriteTools: !cognito,
-      includeSkillManageTools,
+      includeQuestionTools: !subAgentChat,
+      includeSkillManageTools: includeSkillManageTools && !subAgentChat,
+      includeSubAgentTool: !subAgentChat,
+      includeTodoTools: !subAgentChat,
       mcpDiscovery:
         process.env.NAKAMA_MCP_TOOL_DISCOVERY === "1" && !profile.acpAgent,
       userId,
@@ -6489,9 +6509,18 @@ export class AgentService {
       false
     );
 
-    const resolvedSystemPrompt = profile.isSuper
+    const basePrompt = profile.isSuper
       ? `${systemPrompt.trim()}\n\n${SUPER_NAKAMA_TOOL_AUTHORING_RULES}\n\n${SUPER_NAKAMA_TEAM_RULES}`
       : systemPrompt;
+
+    const resolvedSystemPrompt = subAgentChat
+      ? [
+          basePrompt.trim(),
+          "",
+          ...SUB_AGENT_INSTRUCTIONS,
+          "Do not spawn sub-agents.",
+        ].join("\n")
+      : basePrompt;
 
     // A cognito session has nothing stored to load. On a model change it is
     // handed the live history instead, so the conversation survives the
@@ -6565,6 +6594,7 @@ export class AgentService {
     const hasSkillManage = tools.some((tool) => tool.name === "skill_manage");
 
     const toolContext = buildToolExecutionContext({
+      agentDepth: subAgentChat ? 1 : undefined,
       assertCanStartLlmTurn: this.llmTurnQuotaCheckerFor(orgId),
       channel,
       ...this.knowledgeToolContext(orgId, profileId),
