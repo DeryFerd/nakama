@@ -1,5 +1,20 @@
+import { z } from "zod";
 import type { ProfileSummary } from "./contract";
 import { slugifyProfileName } from "./profiles";
+
+/**
+ * What creates or edits a group: the HTTP API and the `create_group` tool.
+ * Strict, so both reject the same inputs.
+ */
+export const agentGroupInputSchema = z
+  .object({
+    brief: z.string().trim().max(4000).default(""),
+    memberIds: z.array(z.string().min(1)).min(2).max(12),
+    name: z.string().trim().min(1).max(80),
+  })
+  .strict();
+
+export type AgentGroupInput = z.input<typeof agentGroupInputSchema>;
 
 export interface AgentGroup {
   /** Changes when the custom image changes; `null` when there is none. */
