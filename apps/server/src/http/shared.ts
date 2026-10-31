@@ -655,6 +655,9 @@ export function parseChannel(value: string | undefined): AgentChannel {
   throw new NakamaApiError(`Invalid channel. Expected ${CHANNEL_LIST}.`, 400);
 }
 
+/** What a turn ends with when it was stopped rather than failed. */
+export const TURN_CANCELLED_ERROR = "Turn cancelled.";
+
 const STREAM_TIMEOUT_MS = resolveChatStreamTimeoutMs();
 
 const FIRST_TOKEN_TIMEOUT_MS = resolveChatFirstTokenTimeoutMs();
@@ -826,7 +829,10 @@ export function streamMessage(
   // which are far too long to wait for in a suite.
   timeoutMs: number = STREAM_TIMEOUT_MS,
   firstTokenTimeoutMs: number = FIRST_TOKEN_TIMEOUT_MS,
-  whatsappMessage?: ToolContext["whatsappMessage"]
+  whatsappMessage?: ToolContext["whatsappMessage"],
+  // False when the client stops turns explicitly (the web app's /stop), so a
+  // dropped connection leaves the turn running.
+  stopOnDisconnect = true
 ): Response {
   const encoder = new TextEncoder();
   const keepaliveIntervalMs = 4000;
@@ -838,13 +844,16 @@ export function streamMessage(
   const turnAbort = new AbortController();
   sessionTurnRegistry.attachAbort(sessionId, turnAbort);
 
-  const turnSignal = requestSignal
-    ? AbortSignal.any([turnAbort.signal, requestSignal])
-    : turnAbort.signal;
+  const turnSignal =
+    requestSignal && stopOnDisconnect
+      ? AbortSignal.any([turnAbort.signal, requestSignal])
+      : turnAbort.signal;
 
   const stream = new ReadableStream<Uint8Array>({
     cancel() {
-      turnAbort.abort();
+      if (stopOnDisconnect) {
+        turnAbort.abort();
+      }
     },
     async start(controller) {
       const { send: publish, getTerminal } = createStreamSenders(
@@ -964,7 +973,7 @@ export function streamMessage(
         }
 
         const errorEvent: Extract<StreamEvent, { type: "error" }> = {
-          error: cancelled ? "Turn cancelled." : formatServerError(error),
+          error: cancelled ? TURN_CANCELLED_ERROR : formatServerError(error),
           type: "error",
         };
 

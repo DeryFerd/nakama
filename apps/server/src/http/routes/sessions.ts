@@ -48,6 +48,7 @@ import {
   streamTurnSubscribe,
 } from "../shared";
 import type { HonoApp } from "../types";
+import { pushTurnEnded } from "./web-push";
 
 const MAX_SESSION_PAGE_SIZE = 100;
 
@@ -1024,6 +1025,24 @@ export function registerSessionRoutes(
     });
   });
 
+  app.post("/v1/sessions/:sessionId/stop", async (c) => {
+    requireOrgMemberFromContext(c);
+
+    const { orgId, sessionId } = await requireSessionAccess(c, {
+      runsTools: true,
+    });
+
+    // The org check lives in the lookup, as on /status; cognito chats too.
+    if (!(await agent.getSessionMessages(sessionId, orgId))) {
+      return errorResponse("Session not found", 404);
+    }
+
+    // The turn still ends through its own stream, which reports the cancel.
+    sessionTurnRegistry.stopTurn(sessionId);
+
+    return new Response(null, { status: 204 });
+  });
+
   app.get("/v1/sessions/:sessionId/stream", async (c) => {
     const { orgId, sessionId } = await requireSessionAccess(c);
     const result = await agent.getSessionMessages(sessionId, orgId);
@@ -1134,6 +1153,12 @@ export function registerSessionRoutes(
       c.req.header("Accept")?.includes("text/event-stream");
 
     if (wantsStream) {
+      const { mode, user } = getRequestAuth(c);
+      // The web app stops a turn through /stop, so its connection dropping is
+      // a phone locking or a tab closing and the turn runs on. Channel workers
+      // still stop by hanging up.
+      const fromBrowser = mode === "browser-session";
+
       return streamMessage(
         sessionId,
         session,
@@ -1144,11 +1169,20 @@ export function registerSessionRoutes(
           if (terminal.type === "done") {
             agent.schedulePostTurnSkillReview(sessionId);
           }
+
+          if (fromBrowser) {
+            void pushTurnEnded(
+              agent,
+              { orgId, sessionId, userId: user.id },
+              terminal
+            );
+          }
         },
         c.req.raw.signal,
         undefined,
         undefined,
-        body.whatsappMessage
+        body.whatsappMessage,
+        !fromBrowser
       );
     }
 
