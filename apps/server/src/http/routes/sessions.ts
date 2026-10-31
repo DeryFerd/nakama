@@ -1,15 +1,12 @@
 import { createRoute, z } from "@hono/zod-openapi";
-import type { AgentChatSession } from "@nakama/agent";
 import type {
   AcpSessionSettingsResponse,
   BranchSessionResponse,
-  ChatTurnUsage,
   CompactionResponse,
   CompactSessionRequest,
   CreateSessionRequest,
   CreateSessionResponse,
   ListSessionsResponse,
-  SendMessageRequest,
   SendMessageResponse,
   SessionBrowserResponse,
   SessionMessagesResponse,
@@ -20,10 +17,8 @@ import type {
 import {
   AGENT_CHANNELS,
   fetchRemoteImage,
-  formatServerError,
   MAX_SESSION_SEARCH_LENGTH,
   NakamaApiError,
-  reportError,
 } from "@nakama/core";
 import { compress } from "hono/compress";
 import {
@@ -32,19 +27,20 @@ import {
 } from "../../services/agent-browser-service";
 import { resolveRequestClientOrigin } from "../../services/composio-callback-url";
 import { sessionTurnRegistry } from "../../services/session-turn-registry";
+import { terminalEvent } from "../../services/turn-runner";
 import type { ServerOptions } from "../context";
 import {
   requireActiveOrgIdFromContext,
   requireOrgMemberFromContext,
 } from "../org-guards";
 import {
+  createTurnStream,
   errorResponse,
   getRequestAuth,
   json,
   parseChannel,
   readJson,
   readOptionalJson,
-  streamMessage,
   streamTurnSubscribe,
 } from "../shared";
 import type { HonoApp } from "../types";
@@ -1089,37 +1085,7 @@ export function registerSessionRoutes(
       runsTools: true,
     });
 
-    const turnStarted = await agent.beginSessionTurn(sessionId, orgId);
-
-    if (turnStarted === null) {
-      return errorResponse("Session not found", 404);
-    }
-
-    if (!turnStarted) {
-      return errorResponse(
-        "A response is already in progress for this session.",
-        409
-      );
-    }
-
-    let session: AgentChatSession;
-    let body: SendMessageRequest;
-
-    try {
-      const resolvedSession = await agent.sessions.get(sessionId, orgId);
-
-      if (!resolvedSession) {
-        sessionTurnRegistry.cancelTurn(sessionId);
-
-        return errorResponse("Session not found", 404);
-      }
-
-      session = resolvedSession;
-      body = await readJson(c.req.raw, sendMessageRequestSchema);
-    } catch (error) {
-      sessionTurnRegistry.cancelTurn(sessionId);
-      throw error;
-    }
+    const body = await readJson(c.req.raw, sendMessageRequestSchema);
 
     if (
       body.whatsappMessage &&
@@ -1127,8 +1093,6 @@ export function registerSessionRoutes(
         c.req.header("X-Nakama-WhatsApp-Context-Token") ?? null
       ))
     ) {
-      sessionTurnRegistry.cancelTurn(sessionId);
-
       return errorResponse(
         "WhatsApp context requires worker authentication.",
         403
@@ -1152,93 +1116,62 @@ export function registerSessionRoutes(
       c.req.query("stream") === "true" ||
       c.req.header("Accept")?.includes("text/event-stream");
 
-    if (wantsStream) {
-      const { mode, user } = getRequestAuth(c);
-      // The web app stops a turn through /stop, so its connection dropping is
-      // a phone locking or a tab closing and the turn runs on. Channel workers
-      // still stop by hanging up.
-      const fromBrowser = mode === "browser-session";
+    const turnStream = wantsStream ? createTurnStream() : null;
+    const { mode, user } = getRequestAuth(c);
+    // The web app stops a turn through /stop, so its stream dropping is a
+    // phone locking or a tab closing and the turn runs on. Channel workers
+    // still stop by hanging up. A JSON turn always runs to the end, so a
+    // client or proxy timeout does not lose a reply saved to history.
+    const fromBrowser = turnStream !== null && mode === "browser-session";
 
-      return streamMessage(
-        sessionId,
-        session,
-        input,
-        (terminal) => {
-          agent.scheduleSessionTitleGeneration(sessionId);
+    const turn = await agent.turns.start(sessionId, orgId, input, {
+      onEvent: turnStream?.onEvent,
+      signal:
+        turnStream && !fromBrowser
+          ? AbortSignal.any([turnStream.signal, c.req.raw.signal])
+          : undefined,
+      whatsappMessage: body.whatsappMessage,
+    });
 
-          if (terminal.type === "done") {
-            agent.schedulePostTurnSkillReview(sessionId);
-          }
-
-          if (fromBrowser) {
-            void pushTurnEnded(
-              agent,
-              { orgId, sessionId, userId: user.id },
-              terminal
-            );
-          }
-        },
-        c.req.raw.signal,
-        undefined,
-        undefined,
-        body.whatsappMessage,
-        !fromBrowser
-      );
+    if (turn.status === "not_found") {
+      return errorResponse("Session not found", 404);
     }
 
-    // close_session stops a turn through this controller, as streamMessage does.
-    const turnAbort = new AbortController();
-    sessionTurnRegistry.attachAbort(sessionId, turnAbort);
-
-    try {
-      const reply = await session.send(input, {
-        signal: turnAbort.signal,
-        whatsappMessage: body.whatsappMessage,
-      });
-
-      const contextUsage = session.getContextUsage() ?? undefined;
-      const usage = session.getTurnUsage() ?? undefined;
-      sessionTurnRegistry.endTurn(sessionId, {
-        reply,
-        type: "done",
-        contextUsage,
-        usage,
-      });
-      agent.scheduleSessionTitleGeneration(sessionId);
-      agent.schedulePostTurnSkillReview(sessionId);
-
-      return json<SendMessageResponse>({
-        reply,
-        contextUsage,
-        usage,
-      });
-    } catch (error) {
-      if (!(error instanceof NakamaApiError && error.status < 500)) {
-        void reportError(error, { kind: "turn", source: "server" });
-      }
-
-      const message = formatServerError(error);
-      // Same guard as the stream error branch: this read sits inside the catch,
-      // so a throw would swallow the failure it is meant to report.
-      let spent: ChatTurnUsage | undefined;
-
-      try {
-        spent = session.getTurnUsage() ?? undefined;
-      } catch {
-        spent = undefined;
-      }
-
-      sessionTurnRegistry.endTurn(sessionId, {
-        error: message,
-        type: "error",
-        usage: spent,
-      });
-
+    if (turn.status === "busy") {
       return errorResponse(
-        message,
-        error instanceof NakamaApiError ? error.status : 500,
-        spent ? { usage: spent } : undefined
+        "A response is already in progress for this session.",
+        409
       );
     }
+
+    if (fromBrowser) {
+      void turn.done.then((end) =>
+        pushTurnEnded(
+          agent,
+          { orgId, sessionId, userId: user.id },
+          terminalEvent(end)
+        )
+      );
+    }
+
+    if (turnStream) {
+      return turnStream.respond(turn.done);
+    }
+
+    const end = await turn.done;
+
+    if (end.kind === "done") {
+      return json<SendMessageResponse>({
+        contextUsage: end.contextUsage,
+        reply: end.reply,
+        usage: end.usage,
+      });
+    }
+
+    return errorResponse(
+      end.message,
+      end.status,
+      end.usage ? { usage: end.usage } : undefined
+    );
   });
 }
