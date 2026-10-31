@@ -1210,9 +1210,30 @@ export function useChatPage() {
     const sessionId = activeSessionIdRef.current;
 
     if (sessionId) {
-      client.stopSessionTurn(sessionId).catch(() => {
-        // No turn left to stop, or the session went away.
-      });
+      // The abort below no longer stops the server, so a lost /stop would
+      // leave the turn running out of sight: try twice, then say so. A 4xx
+      // answer will not change, so only a network or server error retries.
+      const stop = () => client.stopSessionTurn(sessionId);
+
+      stop()
+        .catch((err) => {
+          if (err instanceof NakamaApiError && err.status < 500) {
+            throw err;
+          }
+
+          return stop();
+        })
+        .catch((err) => {
+          // The session went away, and its turn with it.
+          if (err instanceof NakamaApiError && err.status === 404) {
+            return;
+          }
+
+          // Only on the chat that was stopped, not one opened since.
+          if (activeSessionIdRef.current === sessionId) {
+            setError(`The reply could not be stopped: ${formatError(err)}`);
+          }
+        });
     }
 
     detachStreamRef.current = null;
